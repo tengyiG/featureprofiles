@@ -11,7 +11,6 @@ platform_exceptions:  {
   }
   deviations:  {
     static_protocol_name: "STATIC"
-    gribi_encap_header_unsupported: true
     gribi_mac_override_static_arp_static_route: true
     interface_enabled: true
     default_network_instance: "default"
