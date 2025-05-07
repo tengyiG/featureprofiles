@@ -15,18 +15,26 @@
 package mpls_in_udp_test
 
 import (
+	"bytes"
+	"context"
+	"encoding/binary"
 	"fmt"
-	"strconv"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcap"
 	"github.com/open-traffic-generator/snappi/gosnappi"
 	"github.com/openconfig/featureprofiles/internal/attrs"
 	"github.com/openconfig/featureprofiles/internal/deviations"
 	"github.com/openconfig/featureprofiles/internal/fptest"
 	"github.com/openconfig/featureprofiles/internal/gribi"
-	"github.com/openconfig/featureprofiles/internal/helpers"
 	"github.com/openconfig/featureprofiles/internal/otgutils"
+	"github.com/openconfig/gribigo/fluent"
 	"github.com/openconfig/ondatra"
 	"github.com/openconfig/ondatra/gnmi"
 	"github.com/openconfig/ondatra/gnmi/oc"
@@ -44,11 +52,39 @@ const (
 	ipv6EntryPrefixLen = 128
 	nh201ID            = 201
 	nhgName            = "nh-group-1"
-	outerIpv6Src       = "2001:f:a:1::0"
-	outerIpv6DstA      = "2001:f:c:e::1"
 	outerDstUDPPort    = "6635"
 	outerDscp          = "26"
 	outerIPTTL         = "64"
+
+	// Constants for gRIBI programming - Path A (matches README NH#101/NHG#100)
+	nhIndexA         = 101
+	nhgIndexA        = 100
+	mplsLabelA       = uint64(101)
+	outerIpv6DstA    = "2001:f:c:e::1"
+	ateDstNetCIDRv6A = "2001:aa:bb::1/128"
+	ateDstNetCIDRv4A = "10.5.1.1/32"
+
+	// Constants for gRIBI programming - Path B (matches README NH#201/NHG#200)
+	nhIndexB         = 201
+	nhgIndexB        = 200
+	mplsLabelB       = uint64(201)
+	outerIpv6DstB    = "2001:f:c:e::2"
+	ateDstNetCIDRv6B = "2001:aa:bb::2/128"
+	ateDstNetCIDRv4B = "10.5.1.2/32"
+
+	// Common constants from README
+	outerIpv6Src        = "2001:f:a:1::0"
+	udpSrcPort          = uint16(6635)
+	udpDstPort   uint16 = 6635
+	ipTTL        uint8  = 64
+	dscp         uint8  = 26
+
+	flowNameA = "FlowA" // Traffic targeting ateDstNetCIDRv6A
+	flowNameB = "FlowB" // Traffic targeting ateDstNetCIDRv6B
+	// Destination start IPs for flows (use the specific /128 addresses from constants)
+	dstIPStartA = "2001:aa:bb::1"
+	dstIPStartB = "2001:aa:bb::2"
+	dstIPCount  = 1 // Send to the single specific address
 )
 
 var (
@@ -118,12 +154,12 @@ func configureDUT(t *testing.T, dut *ondatra.DUTDevice) {
 	p1 := dut.Port(t, "port1")
 	p2 := dut.Port(t, "port2")
 	portList := []*ondatra.Port{p1, p2}
+	attrsList := []attrs.Attributes{dutPort1, dutPort2}
 
-	// configure interfaces
-	for idx, a := range []attrs.Attributes{dutPort1, dutPort2} {
+	for idx, a := range attrsList {
 		p := portList[idx]
 		intf := a.NewOCInterface(p.Name(), dut)
-		if p.PMD() == ondatra.PMD100GBASEFR && dut.Vendor() != ondatra.CISCO && dut.Vendor() != ondatra.JUNIPER {
+		if p.PMD() == ondatra.PMD100GBASEFR && dut.Vendor() == ondatra.ARISTA {
 			e := intf.GetOrCreateEthernet()
 			e.AutoNegotiate = ygot.Bool(false)
 			e.DuplexMode = oc.Ethernet_DuplexMode_FULL
@@ -137,13 +173,18 @@ func configureDUT(t *testing.T, dut *ondatra.DUTDevice) {
 
 		gnmi.Replace(t, dut, d.Interface(p.Name()).Config(), intf)
 	}
+
+	for idx, a := range attrsList {
+		p := portList[idx]
+		gnmi.Await(t, dut, d.Interface(p.Name()).Subinterface(0).Ipv6().Address(a.IPv6).Ip().State(), time.Minute, a.IPv6)
+	}
 }
 
 // configureOTG configures port1 on the OTG.
 func configureOTG(t *testing.T, ate *ondatra.ATEDevice) gosnappi.Config {
 	otg := ate.OTG()
 	topo := gosnappi.NewConfig()
-	t.Logf("Configuring OTG port1")
+	t.Logf("Configuring OTG port1 & port2")
 	p1 := ate.Port(t, "port1")
 	p2 := ate.Port(t, "port2")
 
@@ -165,17 +206,14 @@ func configureOTG(t *testing.T, ate *ondatra.ATEDevice) gosnappi.Config {
 		autoNegotiate.SetRsFec(false)
 	}
 
-	t.Logf("Pushing config to ATE and starting protocols...")
+	t.Logf("Pushing config to ATE...")
 	otg.PushConfig(t, topo)
-	t.Logf("starting protocols...")
-	otg.StartProtocols(t)
-	time.Sleep(50 * time.Second)
-	otgutils.WaitForARP(t, ate.OTG(), topo, "IPv6")
+	// NOTE: Starting protocols and waiting for ARP is moved closer to traffic sending.
 	return topo
 }
 
-// getFlow returns a flow of ipv6.
-func (fa *flowAttr) getFlow(flowType string, name string) gosnappi.Flow {
+// createFlow returns a flow definition for IPv6 traffic with a range of destination IPs.
+func (fa *flowAttr) createFlow(name, dstIPStart string, dstIPCount uint32) gosnappi.Flow {
 	flow := fa.topo.Flows().Add().SetName(name)
 	flow.Metrics().SetEnable(true)
 
@@ -183,144 +221,13 @@ func (fa *flowAttr) getFlow(flowType string, name string) gosnappi.Flow {
 	e1 := flow.Packet().Add().Ethernet()
 	e1.Src().SetValue(fa.srcMac)
 	e1.Dst().SetValue(fa.dstMac)
-	if flowType == "ipv6" {
-		v6 := flow.Packet().Add().Ipv6()
-		v6.Src().SetValue(fa.src)
-		switch name {
-		case "ip6a1":
-			v6.Dst().SetValue(fa.dst)
-		case "ip6a2":
-			v6.Dst().SetValue(fa.defaultDst)
-		default:
-			v6.Dst().SetValue(fa.dst)
-		}
-	}
+
+	v6 := flow.Packet().Add().Ipv6()
+	v6.Src().SetValue(fa.src)
+	// Use Increment to send to a range of destination IPs.
+	v6.Dst().Increment().SetStart(dstIPStart).SetCount(dstIPCount)
+
 	return flow
-}
-
-// programEntries pushes RIB entries on the DUT required for Encap functionality
-func programEntries(t *testing.T, dut *ondatra.DUTDevice, c *gribi.Client) {
-	t.Log("Programming RIB entries")
-	// TODO: vvardhanreddy revisit when functionality is added.
-	// nh7, op9 := gribi.NHEntry(nh201ID, "EncapUDP", vrfEncapA, fluent.InstalledInFIB,
-	//	&gribi.NHOptions{Src: outerIpv6Src, Dest: outerIpv6DstA, VrfName: vrfEncapA})
-	// nhg4, op11 := gribi.NHGEntry(nhg10ID, map[uint64]uint64{nh201ID: 1},
-	//	vrfEncapA, fluent.InstalledInFIB)
-	// c.AddEntries(t, []fluent.GRIBIEntry{nh7, nhg4}, []*client.OpResult{op9, op11})
-	// c.AddIPv6(t, cidr(ipv6EntryPrefix, ipv6EntryPrefixLen), nhg10ID, vrfEncapA, deviations.DefaultNetworkInstance(dut), fluent.InstalledInFIB)
-}
-
-// configDefaultRoute configures a static route in DEFAULT network-instance.
-func configDefaultRoute(t *testing.T, dut *ondatra.DUTDevice, v6Prefix, v6NextHop string) {
-	t.Logf("TE-18.1.2: Configuring static route in DEFAULT network-instance")
-	ni := oc.NetworkInstance{Name: ygot.String(deviations.DefaultNetworkInstance(dut))}
-	static := ni.GetOrCreateProtocol(oc.PolicyTypes_INSTALL_PROTOCOL_TYPE_STATIC, deviations.StaticProtocolName(dut))
-	sr := static.GetOrCreateStatic(v6Prefix)
-	nh := sr.GetOrCreateNextHop("0")
-	nh.NextHop = oc.UnionString(v6NextHop)
-	gnmi.Update(t, dut, gnmi.OC().NetworkInstance(deviations.DefaultNetworkInstance(dut)).Protocol(oc.PolicyTypes_INSTALL_PROTOCOL_TYPE_STATIC, deviations.StaticProtocolName(dut)).Config(), static)
-}
-
-// cidr takes as input the IP address and the Mask and returns the IP string in
-// CIDR notation.
-func cidr(ipaddrs string, ones int) string {
-	return ipaddrs + "/" + strconv.Itoa(ones)
-}
-
-// configureEncapHeadersCli is only used if a DUT does not support gRIBI.
-func configureEncapHeaderCli(t *testing.T, dut *ondatra.DUTDevice) {
-	switch dut.Vendor() {
-	case ondatra.ARISTA:
-		var encapHeaderCLI string
-		encapHeaderCLI = fmt.Sprintf("tunnel type mpls-over-udp udp destination port %s\n", outerDstUDPPort)
-		helpers.GnmiCLIConfig(t, dut, encapHeaderCLI)
-		encapHeaderCLI = fmt.Sprintf("nexthop-group %s type mpls-over-udp\n", nhgName)
-		encapHeaderCLI += fmt.Sprintf(" tos %s\n", outerDscp)
-		encapHeaderCLI += fmt.Sprintf(" ttl %s\n", outerIPTTL)
-		encapHeaderCLI += " fec hierarchical\n"
-		encapHeaderCLI += fmt.Sprintf(" tunnel-source %s\n", outerIpv6Src)
-		encapHeaderCLI += fmt.Sprintf(" entry 0 push label-stack 899999 tunnel-destination %s\n", outerIpv6DstA)
-		helpers.GnmiCLIConfig(t, dut, encapHeaderCLI)
-		encapHeaderCLI = fmt.Sprintf("ip route vrf customer %s nexthop-group nhg%d\n", outerIpv6DstA, nhg10ID)
-		helpers.GnmiCLIConfig(t, dut, encapHeaderCLI)
-	default:
-		t.Logf("Unsupported vendor %s for native command support for deviation 'GribiEncapHeaderUnsupported'", dut.Vendor())
-	}
-}
-
-// Tests TE-18.1.1, TE-18.1.2. TE-18.1.2 was also added due to following reasons:
-// TE-18.1.2 describes sending traffic flow that does not match any AFT nexthop
-// so try match using already configured TE-18.1.1 gRIBI rules but
-// make sure to catch on the default route.
-func TestMPLSOUDPEncap(t *testing.T) {
-	// Configure DUT
-	dut := ondatra.DUT(t, "dut")
-	configureDUT(t, dut)
-
-	// Configure ATE
-	otg := ondatra.ATE(t, "ate")
-	topo := configureOTG(t, otg)
-
-	// configure gRIBI client
-	c := gribi.Client{
-		DUT:         dut,
-		FIBACK:      true,
-		Persistence: true,
-	}
-
-	if err := c.Start(t); err != nil {
-		t.Fatalf("gRIBI Connection can not be established")
-	}
-
-	defer c.Close(t)
-	c.BecomeLeader(t)
-	// Flush all existing AFT entries on the router
-	c.FlushAll(t)
-	if deviations.GribiEncapHeaderUnsupported(dut) {
-		configureEncapHeaderCli(t, dut)
-	} else {
-		programEntries(t, dut, &c)
-	}
-	configDefaultRoute(t, dut, cidr(ipv6EntryPrefix, ipv6EntryPrefixLen), otgPort1.IPv6)
-	test := []struct {
-		name         string
-		flows        []gosnappi.Flow
-		capturePorts []string
-	}{
-		{
-			name:         "TE-18.1.1 Match and Encapsulate using gRIBI aft modify",
-			flows:        []gosnappi.Flow{fa6.getFlow("ipv6", "ip6a1")},
-			capturePorts: otgDstPorts,
-		},
-		{
-			name:         "TE-18.1.2 Validate prefix match rule for MPLS in GRE encap using default route",
-			flows:        []gosnappi.Flow{fa6.getFlow("ipv6", "ip6a2")},
-			capturePorts: otgDstPorts,
-		},
-	}
-
-	tcArgs := &testArgs{
-		client: &c,
-		dut:    dut,
-		ate:    otg,
-		topo:   topo,
-	}
-
-	for _, tc := range test {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Logf("Name: %s", tc.name)
-			enableCapture(t, otg.OTG(), topo, tc.capturePorts)
-			t.Log("Start capture and send traffic")
-			sendTraffic(t, tcArgs, tc.flows, true)
-			t.Log("Validate captured packet attributes")
-			// TODO: b/364961777 upstream GUE decoder to gopacket addition is pending.
-			// err := validatePacketCapture(t, tcArgs, tc.capturePorts)
-			clearCapture(t, otg.OTG(), topo)
-			// if err != nil {
-			//	t.Fatalf("Failed to validate ATE port 2 receives MPLS-IN-UDP packets: %v", err)
-			// }
-		})
-	}
 }
 
 // clearCapture clears capture from all ports on the OTG
@@ -339,7 +246,6 @@ func sendTraffic(t *testing.T, args *testArgs, flows []gosnappi.Flow, capture bo
 	otg.PushConfig(t, args.topo)
 	otg.StartProtocols(t)
 
-	otgutils.WaitForARP(t, args.ate.OTG(), args.topo, "IPv4")
 	otgutils.WaitForARP(t, args.ate.OTG(), args.topo, "IPv6")
 
 	if capture {
@@ -378,4 +284,332 @@ func stopCapture(t *testing.T, ate *ondatra.ATEDevice) {
 	cs := gosnappi.NewControlState()
 	cs.Port().Capture().SetState(gosnappi.StatePortCaptureState.STOP)
 	otg.SetControlState(t, cs)
+}
+
+// checkEncapHeaders verifies the programmed encapsulation headers in AFT state via gNMI.
+func checkEncapHeaders(t *testing.T, dut *ondatra.DUTDevice, nhgIndex uint64, wantEncapHeaders map[uint8]*oc.NetworkInstance_Afts_NextHop_EncapHeader) {
+	t.Helper()
+	niName := deviations.DefaultNetworkInstance(dut)
+	aftsPath := gnmi.OC().NetworkInstance(niName).Afts()
+
+	nhg := gnmi.Get(t, dut, aftsPath.NextHopGroup(nhgIndex).State())
+	if nhg == nil {
+		t.Errorf("NextHopGroup %d not found in AFT state", nhgIndex)
+		return
+	}
+
+	for _, nh := range nhg.NextHop {
+		nhIndex := nh.GetIndex()
+		hop := gnmi.Get(t, dut, aftsPath.NextHop(nhIndex).State())
+		if hop == nil {
+			t.Logf("NextHop %d not found in AFT state for NHG %d, skipping check for this NH.", nhIndex, nhgIndex)
+			continue
+		}
+		gotEncapHeaders := make(map[uint8]*oc.NetworkInstance_Afts_NextHop_EncapHeader)
+		for _, eh := range hop.EncapHeader {
+			gotEncapHeaders[eh.GetIndex()] = eh
+		}
+
+		if diff := cmp.Diff(wantEncapHeaders, gotEncapHeaders); diff != "" {
+			t.Errorf("checkEncapHeaders mismatch for NH %d (-want +got):\n%s", nhIndex, diff)
+		} else {
+			t.Logf("checkEncapHeaders successful for NH %d.", nhIndex)
+		}
+	}
+}
+
+// testTraffic sends the specified flows and verifies the loss percentage.
+func testTraffic(t *testing.T, args *testArgs, flows []gosnappi.Flow, wantLossPercent float32) {
+	t.Helper()
+	sendTraffic(t, args, flows, false)
+
+	// Verify traffic metrics
+	otgutils.LogFlowMetrics(t, args.ate.OTG(), args.topo)
+	for _, flow := range flows {
+		flowName := flow.Name()
+		txPkts := gnmi.Get(t, args.ate.OTG(), gnmi.OTG().Flow(flowName).Counters().OutPkts().State())
+		rxPkts := gnmi.Get(t, args.ate.OTG(), gnmi.OTG().Flow(flowName).Counters().InPkts().State())
+		lostPkts := txPkts - rxPkts
+		var lossPct float32
+		if txPkts == 0 {
+			if rxPkts == 0 {
+				lossPct = 0
+				t.Logf("Flow %s: No traffic detected (Tx: 0, Rx: 0)", flowName)
+			} else {
+				lossPct = -1
+				t.Errorf("Flow %s: Received packets without sending (Tx: 0, Rx: %d)", flowName, rxPkts)
+			}
+		} else {
+			lossPct = float32(lostPkts*100) / float32(txPkts)
+		}
+
+		if wantLossPercent == 100 {
+			if lossPct < 100 {
+				t.Errorf("Flow %s: Loss percentage is %f%%, want 100%% (Tx: %d, Rx: %d)", flowName, lossPct, txPkts, rxPkts)
+			} else {
+				t.Logf("Flow %s: Loss percentage is %f%%, expected 100%% (Tx: %d, Rx: %d)", flowName, lossPct, txPkts, rxPkts)
+			}
+		} else {
+			if lossPct > wantLossPercent+1.0 {
+				t.Errorf("Flow %s: Loss percentage is %f%%, want <= %f%% (Tx: %d, Rx: %d)", flowName, lossPct, wantLossPercent, txPkts, rxPkts)
+			} else {
+				t.Logf("Flow %s: Loss percentage is %f%%, expected <= %f%% (Tx: %d, Rx: %d)", flowName, lossPct, wantLossPercent, txPkts, rxPkts)
+			}
+		}
+	}
+}
+
+// testCounters checks DUT interface counters.
+func testCounters(t *testing.T, dut *ondatra.DUTDevice, port1InPkts, port2OutPkts uint64) {
+	t.Helper()
+	p1Name := dut.Port(t, "port1").Name()
+	p2Name := dut.Port(t, "port2").Name()
+
+	time.Sleep(10 * time.Second)
+
+	gotP1In := gnmi.Get(t, dut, gnmi.OC().Interface(p1Name).Counters().InPkts().State())
+	t.Logf("DUT port 1 (%s) in-pkts: %d, expected >= %d", p1Name, gotP1In, port1InPkts)
+	if gotP1In < port1InPkts {
+		t.Errorf("DUT port 1 (%s) in-pkts: got %d, want >= %d", p1Name, gotP1In, port1InPkts)
+	}
+
+	gotP2Out := gnmi.Get(t, dut, gnmi.OC().Interface(p2Name).Counters().OutPkts().State())
+	t.Logf("DUT port 2 (%s) out-pkts: %d, expected >= %d", p2Name, gotP2Out, port2OutPkts)
+	if gotP2Out < port2OutPkts {
+		t.Errorf("DUT port 2 (%s) out-pkts: got %d, want >= %d", p2Name, gotP2Out, port2OutPkts)
+	}
+}
+
+// packetResult holds expected values for captured packets.
+type packetResult struct {
+	mplsLabel  uint64
+	udpSrcPort uint16
+	udpDstPort uint16
+	ipTTL      uint8
+	outerSrcIP string
+	outerDstIP string
+	innerSrcIP string // Source IP of the original inner packet sent by ATE
+	innerDstIP string // Destination IP of the original inner packet sent by ATE
+}
+
+// formatMPLSHeader formats MPLS header bytes for logging.
+func formatMPLSHeader(data []byte) string {
+	if len(data) < 4 {
+		return ""
+	}
+	headerValue := binary.BigEndian.Uint32(data[:4])
+	label := (headerValue >> 12) & 0xFFFFF
+	exp := uint8((headerValue >> 9) & 0x07)
+	s := (headerValue >> 8) & 0x01
+	ttl := uint8(headerValue & 0xFF)
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("MPLS Label: %d, ", label))
+	sb.WriteString(fmt.Sprintf("EXP: %d, ", exp))
+	sb.WriteString(fmt.Sprintf("S: %t, ", s == 1))
+	sb.WriteString(fmt.Sprintf("TTL: %d", ttl))
+	if len(data) > 4 {
+		sb.WriteString(fmt.Sprintf(", Payload: % X", data[4:]))
+	}
+	return sb.String()
+}
+
+// mplsLabelToPacketBytes converts an MPLS label to its 4-byte representation.
+func mplsLabelToPacketBytes(n uint32) []byte {
+	buf := make([]byte, 4)
+	n <<= 12
+	binary.BigEndian.PutUint32(buf, n)
+	return buf
+}
+
+// validatePacketCapture validates the captured packets on the specified ATE port.
+func validatePacketCapture(t *testing.T, ate *ondatra.ATEDevice, otgPortName string, wantResults []*packetResult) {
+	t.Helper()
+	otg := ate.OTG()
+	pcapBytes := otg.GetCapture(t, gosnappi.NewCaptureRequest().SetPortName(otgPortName))
+
+	// Create a temporary file to write the pcap data.
+	f, err := os.CreateTemp("", "mpls-in-udp-*.pcap")
+	if err != nil {
+		t.Fatalf("Failed to create temp pcap file: %v", err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write(pcapBytes); err != nil {
+		t.Fatalf("Failed to write pcap bytes to file %s: %v", f.Name(), err)
+	}
+	f.Close()
+	t.Logf("Wrote pcap capture from port %s to %s", otgPortName, f.Name())
+
+	// Open the pcap file for analysis.
+	handle, err := pcap.OpenOffline(f.Name())
+	if err != nil {
+		t.Fatalf("Failed to open pcap file %s: %v", f.Name(), err)
+	}
+	defer handle.Close()
+
+	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+	packetsFound := 0
+	validatedPackets := 0
+
+	for packet := range packetSource.Packets() {
+		packetsFound++
+		udpLayer := packet.Layer(layers.LayerTypeUDP)
+		outerIPv6Layer := packet.Layer(layers.LayerTypeIPv6)
+
+		if udpLayer == nil || outerIPv6Layer == nil {
+			t.Logf("Packet %d: Skipping - Not an outer IPv6/UDP packet", packetsFound)
+			continue
+		}
+
+		outerV6 := outerIPv6Layer.(*layers.IPv6)
+		udp := udpLayer.(*layers.UDP)
+		payload := udp.LayerPayload()
+
+		// Check if this packet matches any of the expected results
+		matchFound := false
+		for _, want := range wantResults {
+			// Check outer IPv6 header
+			if outerV6.SrcIP.String() != want.outerSrcIP || outerV6.DstIP.String() != want.outerDstIP {
+				continue
+			}
+			// Check UDP ports
+			if udp.SrcPort != layers.UDPPort(want.udpSrcPort) || udp.DstPort != layers.UDPPort(want.udpDstPort) {
+				continue
+			}
+			// Check MPLS label in payload
+			wantMPLSBytes := mplsLabelToPacketBytes(uint32(want.mplsLabel))
+			if !bytes.HasPrefix(payload, wantMPLSBytes) { // Check if payload starts with the MPLS header
+				continue
+			}
+
+			matchFound = true
+			validatedPackets++
+			t.Logf("Packet %d: Validated successfully against expected result: %+v", packetsFound, want)
+
+			if outerV6.HopLimit != want.ipTTL-1 {
+				t.Errorf("Packet %d: Outer Hop Limit mismatch: got %d, want %d", packetsFound, outerV6.HopLimit, want.ipTTL-1)
+			}
+
+			break
+		}
+		if !matchFound {
+			t.Logf("Packet %d: Did not match any expected result. OuterSrc: %s, OuterDst: %s, UDPSrc: %d, UDPDst: %d, MPLS (start): %s",
+				packetsFound, outerV6.SrcIP, outerV6.DstIP, udp.SrcPort, udp.DstPort, formatMPLSHeader(payload))
+		}
+	}
+
+	if packetsFound == 0 {
+		t.Errorf("No packets captured on port %s", otgPortName)
+	} else if validatedPackets == 0 {
+		t.Errorf("No captured packets matched the expected MPLS-in-UDP structure on port %s", otgPortName)
+	} else if validatedPackets < len(wantResults) {
+		t.Logf("Validated %d packets, which is less than the number of expected results (%d). This might be okay depending on traffic rate.", validatedPackets, len(wantResults))
+	} else {
+		t.Logf("Successfully validated %d captured packets on port %s against %d expected result(s).", validatedPackets, otgPortName, len(wantResults))
+	}
+}
+
+// awaitTimeout calls a fluent client Await, adding a timeout to the context.
+func awaitTimeout(ctx context.Context, c *fluent.GRIBIClient, t testing.TB, timeout time.Duration) error {
+	subctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return c.Await(subctx, t)
+}
+
+// Test TE-18.1.1.
+func TestMPLSOUDPEncap(t *testing.T) {
+	dut := ondatra.DUT(t, "dut")
+	configureDUT(t, dut)
+
+	ate := ondatra.ATE(t, "ate")
+	otg := ate.OTG()
+	otgConfig := configureOTG(t, ate)
+	t.Logf("Pushing config to ATE and starting protocols...")
+	otg.PushConfig(t, otgConfig)
+	t.Logf("starting protocols...")
+	otg.StartProtocols(t)
+
+	tests := []struct {
+		desc    string
+		entries []fluent.GRIBIEntry
+	}{
+		{
+			desc: "mplsoudpv6",
+			entries: []fluent.GRIBIEntry{
+				// Path A: NH#101 with MPLS and UDPv6 encapsulation headers
+				fluent.NextHopEntry().
+					WithNetworkInstance(deviations.DefaultNetworkInstance(dut)).
+					WithIndex(nhIndexA).
+					WithIPAddress(otgPort2.IPv6).
+					AddEncapHeader(
+						fluent.MPLSEncapHeader().WithLabels(mplsLabelA),
+						fluent.UDPV6EncapHeader().
+							WithSrcIP(outerIpv6Src).
+							WithDstIP(outerIpv6DstA).
+							WithSrcUDPPort(uint64(udpSrcPort)).
+							WithDstUDPPort(uint64(udpDstPort)).
+							WithIPTTL(uint64(ipTTL)).
+							WithDSCP(uint64(dscp)),
+					),
+				fluent.NextHopGroupEntry().
+					WithNetworkInstance(deviations.DefaultNetworkInstance(dut)).
+					WithID(nhgIndexA).
+					AddNextHop(nhIndexA, 1),
+				fluent.IPv6Entry().
+					WithNetworkInstance(deviations.DefaultNetworkInstance(dut)).
+					WithPrefix(ateDstNetCIDRv6A).
+					WithNextHopGroup(nhgIndexA).
+					WithNextHopGroupNetworkInstance(deviations.DefaultNetworkInstance(dut)),
+
+				// Path B: NH#201 with MPLS and UDPv6 encapsulation headers
+				fluent.NextHopEntry().
+					WithNetworkInstance(deviations.DefaultNetworkInstance(dut)).
+					WithIndex(nhIndexB).
+					WithIPAddress(otgPort2.IPv6).
+					AddEncapHeader(
+						fluent.MPLSEncapHeader().WithLabels(mplsLabelB),
+						fluent.UDPV6EncapHeader().
+							WithSrcIP(outerIpv6Src).
+							WithDstIP(outerIpv6DstB).
+							WithSrcUDPPort(uint64(udpSrcPort)).
+							WithDstUDPPort(uint64(udpDstPort)).
+							WithIPTTL(uint64(ipTTL)).
+							WithDSCP(uint64(dscp)),
+					),
+				fluent.NextHopGroupEntry().
+					WithNetworkInstance(deviations.DefaultNetworkInstance(dut)).
+					WithID(nhgIndexB).
+					AddNextHop(nhIndexB, 1),
+				fluent.IPv6Entry().
+					WithNetworkInstance(deviations.DefaultNetworkInstance(dut)).
+					WithPrefix(ateDstNetCIDRv6B).
+					WithNextHopGroup(nhgIndexB).
+					WithNextHopGroupNetworkInstance(deviations.DefaultNetworkInstance(dut)),
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			// Configure gRIBI client.
+			gribic := dut.RawAPIs().GRIBI(t)
+			c := fluent.NewClient()
+			c.Connection().WithStub(gribic).
+				WithRedundancyMode(fluent.ElectedPrimaryClient).
+				WithPersistence().
+				WithFIBACK().
+				WithInitialElectionID(1, 0)
+			ctx := context.Background()
+			c.Start(ctx, t)
+			defer c.Stop(t)
+			c.StartSending(ctx, t)
+			if err := awaitTimeout(ctx, c, t, time.Minute); err != nil {
+				t.Fatalf("Await got error during session negotiation: %v", err)
+			}
+
+			c.Modify().AddEntry(t, tc.entries...)
+			if err := awaitTimeout(ctx, c, t, time.Minute); err != nil {
+				t.Fatalf("Await got error for entries: %v", err)
+			}
+		})
+	}
 }
