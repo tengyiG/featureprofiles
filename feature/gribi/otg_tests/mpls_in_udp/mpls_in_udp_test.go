@@ -141,7 +141,7 @@ func configureDUT(t *testing.T, dut *ondatra.DUTDevice) {
 	for idx, a := range dutPortAttrs {
 		p := portList[idx]
 		intf := a.NewOCInterface(p.Name(), dut)
-		if p.PMD() == ondatra.PMD100GBASEFR && dut.Vendor() != ondatra.CISCO && dut.Vendor() != ondatra.JUNIPER {
+		if p.PMD() == ondatra.PMD100GBASELR4 && dut.Vendor() != ondatra.CISCO && dut.Vendor() != ondatra.JUNIPER {
 			e := intf.GetOrCreateEthernet()
 			e.AutoNegotiate = ygot.Bool(false)
 			e.DuplexMode = oc.Ethernet_DuplexMode_FULL
@@ -175,7 +175,7 @@ func configureOTG(t *testing.T, ate *ondatra.ATEDevice) gosnappi.Config {
 	pmd100GFRPorts := []string{}
 	for _, p := range topo.Ports().Items() {
 		port := ate.Port(t, p.Name())
-		if port.PMD() == ondatra.PMD100GBASEFR {
+		if port.PMD() == ondatra.PMD100GBASELR4 {
 			pmd100GFRPorts = append(pmd100GFRPorts, port.ID())
 		}
 	}
