@@ -4,7 +4,7 @@
 uuid:  "36cc79b5-3766-4cb4-b83b-1baea1464dc8"
 plan_id:  "TE-18.1"
 description:  "gRIBI MPLS in UDP Encapsulation"
-testbed:  TESTBED_DUT_ATE_4LINKS
+testbed:  TESTBED_DUT_ATE_2LINKS
 platform_exceptions:  {
   platform:  {
     vendor: ARISTA
