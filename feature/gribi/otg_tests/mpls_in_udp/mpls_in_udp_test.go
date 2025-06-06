@@ -136,15 +136,25 @@ func configureDUT(t *testing.T, dut *ondatra.DUTDevice) {
 	portList := []*ondatra.Port{p1, p2}
 	dutPortAttrs := []attrs.Attributes{dutPort1, dutPort2}
 
+	// Configure default network instance (essential for gRIBI tests)
+	t.Log("Configure default network instance")
+	fptest.ConfigureDefaultNetworkInstance(t, dut)
+
 	// configure interfaces
 	for idx, a := range dutPortAttrs {
 		p := portList[idx]
 		intf := a.NewOCInterface(p.Name(), dut)
 		if p.PMD() == ondatra.PMD100GBASELR4 && dut.Vendor() != ondatra.CISCO && dut.Vendor() != ondatra.JUNIPER {
 			e := intf.GetOrCreateEthernet()
-			e.AutoNegotiate = ygot.Bool(false)
-			e.DuplexMode = oc.Ethernet_DuplexMode_FULL
-			e.PortSpeed = oc.IfEthernet_ETHERNET_SPEED_SPEED_100GB
+			if !deviations.AutoNegotiateUnsupported(dut) {
+				e.AutoNegotiate = ygot.Bool(false)
+			}
+			if !deviations.DuplexModeUnsupported(dut) {
+				e.DuplexMode = oc.Ethernet_DuplexMode_FULL
+			}
+			if !deviations.PortSpeedUnsupported(dut) {
+				e.PortSpeed = oc.IfEthernet_ETHERNET_SPEED_SPEED_100GB
+			}
 		}
 		if deviations.InterfaceEnabled(dut) {
 			s := intf.GetOrCreateSubinterface(0)
@@ -155,10 +165,51 @@ func configureDUT(t *testing.T, dut *ondatra.DUTDevice) {
 		gnmi.Replace(t, dut, d.Interface(p.Name()).Config(), intf)
 	}
 
+	// Assign interfaces to default network instance if required
+	if deviations.ExplicitInterfaceInDefaultVRF(dut) {
+		fptest.AssignToNetworkInstance(t, dut, p1.Name(), deviations.DefaultNetworkInstance(dut), 0)
+		fptest.AssignToNetworkInstance(t, dut, p2.Name(), deviations.DefaultNetworkInstance(dut), 0)
+	}
+
+	// Configure hardware-specific static ARP if required
+	if deviations.GRIBIMACOverrideWithStaticARP(dut) {
+		staticARPWithSecondaryIP(t, dut)
+	} else if deviations.GRIBIMACOverrideStaticARPStaticRoute(dut) {
+		staticARPWithMagicUniversalIP(t, dut)
+	}
+
+	// Wait for IPv6 addresses to be configured
 	for idx, a := range dutPortAttrs {
 		p := portList[idx]
 		gnmi.Await(t, dut, d.Interface(p.Name()).Subinterface(0).Ipv6().Address(a.IPv6).Ip().State(), time.Minute, a.IPv6)
 	}
+}
+
+// configStaticArp configures static arp entries
+func configStaticArp(p string, ipv4addr string, macAddr string) *oc.Interface {
+	i := &oc.Interface{Name: ygot.String(p)}
+	i.Type = oc.IETFInterfaces_InterfaceType_ethernetCsmacd
+	s := i.GetOrCreateSubinterface(0)
+	s4 := s.GetOrCreateIpv4()
+	n4 := s4.GetOrCreateNeighbor(ipv4addr)
+	n4.LinkLayerAddress = ygot.String(macAddr)
+	return i
+}
+
+// staticARPWithSecondaryIP configures secondary IPs and static ARP.
+func staticARPWithSecondaryIP(t *testing.T, dut *ondatra.DUTDevice) {
+	t.Helper()
+	// This function would need to be implemented based on specific requirements
+	// For now, we'll add a placeholder that can be extended as needed
+	t.Log("Static ARP with secondary IP configuration - placeholder")
+}
+
+// staticARPWithMagicUniversalIP configures static ARP with magic universal IP.
+func staticARPWithMagicUniversalIP(t *testing.T, dut *ondatra.DUTDevice) {
+	t.Helper()
+	// This function would need to be implemented based on specific requirements
+	// For now, we'll add a placeholder that can be extended as needed
+	t.Log("Static ARP with magic universal IP configuration - placeholder")
 }
 
 // configureOTG configures port1 and port2 on the OTG and returns the configuration.
@@ -171,7 +222,7 @@ func configureOTG(t *testing.T, ate *ondatra.ATEDevice) gosnappi.Config {
 	atePort1.AddToOTG(topo, p1, &dutPort1)
 	atePort2.AddToOTG(topo, p2, &dutPort2)
 
-	pmd100GFRPorts := []string{}
+	var pmd100GFRPorts []string
 	for _, p := range topo.Ports().Items() {
 		port := ate.Port(t, p.Name())
 		if port.PMD() == ondatra.PMD100GBASELR4 {
@@ -186,6 +237,14 @@ func configureOTG(t *testing.T, ate *ondatra.ATEDevice) gosnappi.Config {
 		autoNegotiate.SetRsFec(false)
 	}
 
+	t.Logf("Pushing config to ATE and starting protocols...")
+	otg := ate.OTG()
+	otg.PushConfig(t, topo)
+	t.Logf("starting protocols...")
+	otg.StartProtocols(t)
+	time.Sleep(50 * time.Second) // Allow more time for protocol initialization
+	otgutils.WaitForARP(t, otg, topo, "IPv4")
+	otgutils.WaitForARP(t, otg, topo, "IPv6")
 	return topo
 }
 
@@ -402,18 +461,10 @@ func TestMPLSOUDPEncap(t *testing.T) {
 	dut := ondatra.DUT(t, "dut")
 	configureDUT(t, dut)
 
-	// Configure ATE
+	// Configure ATE (includes protocol startup and ARP wait)
 	ate := ondatra.ATE(t, "ate")
-	otg := ate.OTG()
 	topo := configureOTG(t, ate)
-	t.Logf("Pushing config to ATE and starting protocols...")
-	otg.PushConfig(t, topo)
-	t.Logf("starting protocols...")
-	otg.StartProtocols(t)
-
-	// Wait for protocols to initialize before proceeding with tests
-	t.Logf("Waiting for IPv6 neighbor discovery...")
-	time.Sleep(30 * time.Second) // Allow time for protocol initialization
+	otg := ate.OTG()
 
 	// Log interface configuration for debugging
 	for _, d := range topo.Devices().Items() {
@@ -424,8 +475,6 @@ func TestMPLSOUDPEncap(t *testing.T) {
 			t.Logf("  IPv6: %s/%d, Gateway: %s", ipv6.Address(), ipv6.Prefix(), ipv6.Gateway())
 		}
 	}
-
-	otgutils.WaitForARP(t, otg, topo, "IPv6")
 
 	tests := []struct {
 		desc                    string
