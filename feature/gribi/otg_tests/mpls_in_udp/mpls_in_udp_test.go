@@ -49,7 +49,6 @@ const (
 	ipv6PrefixLen      = 126
 	ipv6FlowIP         = "2015:aa8::1"
 	trafficDuration    = 15 * time.Second
-	vrfEncapA          = "ENCAP_TE_VRF_A"
 	ipv6EntryPrefix    = "2015:aa8::"
 	ipv6EntryPrefixLen = 128
 
@@ -162,7 +161,7 @@ func configureDUT(t *testing.T, dut *ondatra.DUTDevice) {
 	}
 }
 
-// configureOTG configures port1 on the OTG and returns the configuration.
+// configureOTG configures port1 and port2 on the OTG and returns the configuration.
 func configureOTG(t *testing.T, ate *ondatra.ATEDevice) gosnappi.Config {
 	topo := gosnappi.NewConfig()
 	t.Logf("Configuring OTG port1 & port2")
@@ -245,7 +244,6 @@ func stopCapture(t *testing.T, ate *ondatra.ATEDevice) {
 // destination network via srcEndPoint to dstEndPoint and checks for
 // packet loss and returns loss percentage as float.
 func testTrafficv6(t *testing.T, otg *otg.OTG, srcEndPoint, dstEndPoint attrs.Attributes, startAddress string, dur time.Duration) float32 {
-	otgutils.WaitForARP(t, otg, otg.FetchConfig(t), "IPv6")
 	top := otg.FetchConfig(t)
 	top.Flows().Clear().Items()
 	flowipv6 := top.Flows().Add().SetName(flowName)
@@ -413,6 +411,22 @@ func TestMPLSOUDPEncap(t *testing.T) {
 	t.Logf("starting protocols...")
 	otg.StartProtocols(t)
 
+	// Wait for protocols to initialize before proceeding with tests
+	t.Logf("Waiting for IPv6 neighbor discovery...")
+	time.Sleep(30 * time.Second) // Allow time for protocol initialization
+
+	// Log interface configuration for debugging
+	for _, d := range topo.Devices().Items() {
+		eth := d.Ethernets().Items()[0]
+		t.Logf("Device: %s, Interface: %s", d.Name(), eth.Name())
+		if len(eth.Ipv6Addresses().Items()) > 0 {
+			ipv6 := eth.Ipv6Addresses().Items()[0]
+			t.Logf("  IPv6: %s/%d, Gateway: %s", ipv6.Address(), ipv6.Prefix(), ipv6.Gateway())
+		}
+	}
+
+	otgutils.WaitForARP(t, otg, topo, "IPv6")
+
 	tests := []struct {
 		desc                    string
 		entries                 []fluent.GRIBIEntry
@@ -450,7 +464,7 @@ func TestMPLSOUDPEncap(t *testing.T) {
 					WithID(nhgIndex).
 					AddNextHop(nh101Index, 1),
 				fluent.IPv6Entry().
-					WithNetworkInstance(vrfEncapA). // Matching in VRF_ENCAP_A
+					WithNetworkInstance(deviations.DefaultNetworkInstance(dut)).
 					WithPrefix(innerIPv6DstAPrefix).
 					WithNextHopGroup(nhgIndex).
 					WithNextHopGroupNetworkInstance(deviations.DefaultNetworkInstance(dut)), // NHG is in Default NI
