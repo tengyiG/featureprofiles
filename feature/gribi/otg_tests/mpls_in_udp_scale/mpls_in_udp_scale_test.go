@@ -1,4 +1,4 @@
-package mpls_in_udp_scale
+package mpls_in_udp_scale_test
 
 import (
 	"testing"
